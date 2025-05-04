@@ -1,0 +1,141 @@
+# It starts from ultralytics.models.yolo.detect.train.py
+
+    def get_model(self, cfg=None, weights=None, verbose=True):
+        """
+        Return a YOLO detection model.
+
+        Args:
+            cfg (str, optional): Path to model configuration file.
+            weights (str, optional): Path to model weights.
+            verbose (bool): Whether to display model information.
+
+        Returns:
+            (DetectionModel): YOLO detection model.
+        """
+        model = DetectionModel(cfg, nc=self.data["nc"], ch=self.data["channels"], verbose=verbose and RANK == -1)
+        if weights:
+            model.load(weights)
+        return model
+
+# Since model = DetectionModel(cfg, nc, ch, verbose), we move to DetectionModel
+
+# DetectionModel is imported at the top: from ultralytics.nn.tasks import DetectionModel
+# So go to ultralytics/nn/tasks.py
+
+# In class DetectionModel(BaseModel), the __init__ shows:
+# cfg = "yolo11n.yaml" is the default, though it would vary depending on the weights
+-> line 311
+
+self.yaml = cfg or yaml_model_load(cfg)
+-> line 322
+
+self.model, self.save = parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)
+-> line 335
+
+# So we now need to check cfg and parse_model
+
+# parse_model is defined in the same file, ultralytics/nn/tasks.py, line 1330
+
+# The first argument `d` is model_dict
+
+# At line 1347, we see:
+nc, act, scales = (d.get(x) for x in ("nc", "activation", "scales"))
+# This shows that d is something like:
+d = {
+    "nc": 80,
+    "activation": "ReLU",
+    "scales": [0.33, 0.25, 1024],
+    "depth_multiple": [...],
+    "width_multiple": [],
+    "kpt_shape": [],
+    ...
+}
+
+# parse_model returns torch.nn.Sequential(*layers), sorted(save) -> line 1505
+# It is constructed from base_modules (line 1365) and repeat_modules (line 1403)
+
+>> Therefore, if you want to inject a custom backbone, you can hook it into the output of parse_model. <<
+
+# Since self.model = torch.nn.Sequential(*layers), you can modify self.model to insert your custom backbone.
+
+# Now, for cfg,
+# We look into ultralytics/cfg/models/v8 because we are using YOLOv8
+
+# In yolov8.yaml line 20, the first layer in backbone is Conv
+# Conv is defined in ultralytics/nn/modules/conv.py
+
+# The Conv class is defined at line 37.
+# At line 79, return value shows that this class is a conv + batchnorm + activation block
+
+# Then at line 94, there is Conv2 which inherits from Conv
+# Conv2 sets kernel size to 3
+
+# In Conv2's return (line 144): self.act(self.bn(self.conv(x)))
+
+# Important note: in Conv (line 50), only c1, c2 are required positional arguments
+
+# However, in yolov8.yaml line 20, the args are [64, 3, 2] — these are likely output_channel, kernel_size, stride
+# There's no input_channel here.
+
+-> But input_channel is passed as `ch` = 3 in DetectionModel (line 311)
+
+# Back in yolov8.yaml, line 18 defines the 'backbone'
+# The first line in backbone is: [-1, 1, Conv, [64, 3, 2]]
+# But this Conv is not inserted blindly
+
+# We have to look again at DetectionModel in ultralytics/nn/tasks.py
+
+# At line 335: parse_model(deepcopy(self.yaml), ch=ch, verbose=verbose)
+
+# Then at line 1330: def parse_model(d, ch, verbose=True):
+
+# So d = self.yaml and ch = 3 from DetectionModel
+
+# Now looking at parse_model:
+# At line 1436: if the module is in base_modules (defined at line 1365),
+# then c1, c2 = input_channel, output_channel
+
+# At line 1438: make_divisible is used
+# It comes from ultralytics.utils.ops (line 82 import)
+
+# At line 130 in ops.py:
+def make_divisible(x, a): returns the nearest value >= x that is divisible by a
+
+# Back to tasks.py:
+# From lines 1422 to 1504, each line in YAML is processed to determine input/output channels
+# Then modules are stacked and returned as a model
+
+"""
+So, if you want to replace the **first block in the backbone**, you need to:
+
+1) Edit the first line in your YAML file
+2) Register your custom module where Conv is handled
+3) In lines 1502–1503, when i == 0 (first block), ch is assigned c2.
+   - You can add an `elif` statement, or
+   - Add your custom module to base_modules list so it's handled automatically
+   - If your module already exists, it might be already handled
+4) ...
+
+In ultralytics/nn/modules/conv.py, add your custom class name to the `__all__` list (line 10)
+→ So it can be imported and used elsewhere.
+"""
+
+# Even if you do:
+model.model[0] = CustomClass(...)
+# It may not take effect during training because of default config overrides.
+
+# The reason is likely at line 263 in ultralytics/engine/model.py:
+self.model.args = {**DEFAULT_CFG_DICT, **self.overrides}
+
+# At line 14:
+from ultralytics.utils import DEFAULT_CFG_DICT
+
+# DEFAULT_CFG_DICT is defined at line 546 in:
+ultralytics/utils/__init__.py
+
+-> DEFAULT_CFG_DICT = yaml_load(DEFAULT_CFG_PATH)
+
+# At line 41:
+DEFAULT_CFG_PATH = ROOT / "cfg/default.yaml"
+
+# If you open ultralytics/cfg/default.yaml, you'll see default config values are hardcoded there.
